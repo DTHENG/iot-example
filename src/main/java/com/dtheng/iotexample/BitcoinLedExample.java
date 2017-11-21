@@ -8,10 +8,7 @@ import retrofit.RestAdapter;
 import rx.Observable;
 import rx.schedulers.Schedulers;
 
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.List;
-import java.util.Optional;
+import java.util.*;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -21,74 +18,98 @@ import java.util.concurrent.TimeUnit;
 public class BitcoinLedExample {
 
     private static final int numberOfLights = 5;
+    private static final int defaultSpeedMs = 750;
 
     private static final GpioController controller = GpioFactory.getInstance();
-    private static final GpioPinDigitalOutput redLightOne = controller.provisionDigitalOutputPin(RaspiPin.GPIO_00);
-    private static final GpioPinDigitalOutput redLightTwo = controller.provisionDigitalOutputPin(RaspiPin.GPIO_01);
-    private static final GpioPinDigitalOutput redLightThree = controller.provisionDigitalOutputPin(RaspiPin.GPIO_02);
-    private static final GpioPinDigitalOutput redLightFour = controller.provisionDigitalOutputPin(RaspiPin.GPIO_03);
-    private static final GpioPinDigitalOutput redLightFive = controller.provisionDigitalOutputPin(RaspiPin.GPIO_04);
+
+    private static final List<GpioPinDigitalOutput> redLights = Arrays.asList(
+            controller.provisionDigitalOutputPin(RaspiPin.GPIO_00),
+            controller.provisionDigitalOutputPin(RaspiPin.GPIO_01),
+            controller.provisionDigitalOutputPin(RaspiPin.GPIO_02),
+            controller.provisionDigitalOutputPin(RaspiPin.GPIO_03),
+            controller.provisionDigitalOutputPin(RaspiPin.GPIO_04));
 
     private static final GpioPinDigitalOutput yellowLightOne = controller.provisionDigitalOutputPin(RaspiPin.GPIO_05);
 
-    private static final GpioPinDigitalInput button = controller.provisionDigitalInputPin(RaspiPin.GPIO_29);
+    private static final GpioPinDigitalInput startButton = controller.provisionDigitalInputPin(RaspiPin.GPIO_29);
+    private static final GpioPinDigitalInput modeButton = controller.provisionDigitalInputPin(RaspiPin.GPIO_28);
 
-    private static final RestAdapter retrofit = new RestAdapter.Builder()
-            .setEndpoint("https://api.sendwyre.com/")
-            .build();
+    private static final RestAdapter retrofit = new RestAdapter.Builder().setEndpoint("https://api.sendwyre.com/").build();
 
     private static final WyreRatesService wyreRatesService = retrofit.create(WyreRatesService.class);
 
-    static boolean isDisplayingRate = false;
+    private static boolean isDisplayingRate = false;
+    private static Mode mode = Mode.DEFAULT;
+    private static int speedMs = 750;
 
     public static void main(String[] args) {
 
-        log.info("Starting...");
+        log.info("Starting Bitcoin Led Example...");
 
         // Reset lights
-        reset();
+        reset()
+            .subscribe(Void -> {},
+                throwable -> log.error("subscribe error: {}", throwable.toString()));
 
-        button.addListener(new GpioPinListenerDigital() {
-            @Override
-            public void handleGpioPinDigitalStateChangeEvent(GpioPinDigitalStateChangeEvent gpioPinDigitalStateChangeEvent) {
-                switch (gpioPinDigitalStateChangeEvent.getState()) {
-                    case HIGH:
-                        displayExchangeRate()
-                            .subscribe(Void -> {},
-                                throwable -> log.error("subscribe error: "+ throwable.toString()));
-                }
-            }
-        });
+        // Setup button listeners
+        startButton.addListener(new Listener.StartButton());
+        modeButton.addListener(new Listener.ModeButton());
 
         // Creates a new stream every 10 minutes
         Observable.interval(0, 10, TimeUnit.MINUTES, Schedulers.trampoline())
+            .flatMap(Void -> displayExchangeRate())
+            .subscribe(
 
-                .flatMap(Void -> displayExchangeRate())
+                // onNext, do nothing
+                Void -> {},
 
-                .subscribe(Void -> {},
-                        throwable -> log.error("subscribe error: "+ throwable.toString()),
-                        () -> {
-                            log.info("subscribe onComplete");
-                            controller.shutdown();
-                        });
+                // onError, log error
+                throwable -> log.error("subscribe error: {}", throwable.toString()),
+
+                // onCompleted, shutdown IO controller
+                controller::shutdown);
+    }
+
+    private static Observable<Void> changeMode() {
+        if (isDisplayingRate)
+            return Observable.empty();
+        return reset()
+            .defaultIfEmpty(null)
+            .doOnNext(Void -> {
+                switch (mode) {
+                    case DEFAULT:
+                        mode = Mode.BINARY;
+                        speedMs = defaultSpeedMs;
+                        break;
+                    case BINARY:
+                        mode = Mode.FAST;
+                        speedMs = defaultSpeedMs / 2;
+                        break;
+                    case FAST:
+                        mode = Mode.SLOW;
+                        speedMs = defaultSpeedMs * 2;
+                        break;
+                    case SLOW:
+                        mode = Mode.DEFAULT;
+                        speedMs = defaultSpeedMs;
+                        break;
+                }
+            })
+            .doOnNext(Void -> redLights.get(mode.ordinal()).setState(true))
+            .delay(1, TimeUnit.SECONDS)
+            .flatMap(Void -> reset());
     }
 
     private static Observable<Void> displayExchangeRate() {
         return Observable.defer(() -> {
-            log.debug("displayExchangeRate isDisplayingRate {}", isDisplayingRate);
+
             if (isDisplayingRate)
                 return Observable.empty();
 
             isDisplayingRate = true;
 
-            // Turn on yellow light, indicating network request
-            yellowLightOne.setState(true);
-
             // Get rates from api
-            return wyreRatesService.rates()
-
-                    // Disable yellow light
-                    .doOnNext(Void -> yellowLightOne.setState(false))
+            return getRates()
 
                     // Get the USD to BTC exchange rate
                     .map(node -> Optional.ofNullable(node.get("USDBTC")))
@@ -99,70 +120,117 @@ public class BitcoinLedExample {
                     // Unwrap the value
                     .map(Optional::get)
 
-                    .flatMap(rate -> buildExchangeRateArray(rate)
-                            .toList())
-
-                    .flatMap(exchangeRateArray -> {
-
-                        log.info("USDBTC {}", exchangeRateArray);
-
-                        // List of observables configured to trigger a light to blink a certain number of times
-                        List<Observable<Void>> oBlinks = new ArrayList<>();
-
-                        oBlinks.add(blink(redLightOne).repeat(exchangeRateArray.get(0)).ignoreElements().cast(Void.class));
-                        oBlinks.add(blink(redLightTwo).repeat(exchangeRateArray.get(1)).ignoreElements().cast(Void.class));
-                        oBlinks.add(blink(redLightThree).repeat(exchangeRateArray.get(2)).ignoreElements().cast(Void.class));
-                        oBlinks.add(blink(redLightFour).repeat(exchangeRateArray.get(3)).ignoreElements().cast(Void.class));
-                        oBlinks.add(blink(redLightFive).repeat(exchangeRateArray.get(4)).ignoreElements().cast(Void.class));
-
-                        // Run observables in order one after the other
-                        return Observable.concat(oBlinks);
+                    .flatMap(rate -> {
+                        switch (mode) {
+                            case DEFAULT:
+                            case FAST:
+                            case SLOW:
+                                return defaultModeHandler(rate);
+                            case BINARY:
+                                return binaryModeHandler(rate);
+                            default:
+                                throw new RuntimeException("Unknown mode: "+ mode.name());
+                        }
                     })
-                    .toList()
+                    .defaultIfEmpty(null)
                     .doOnNext(Void -> isDisplayingRate = false)
-                    .ignoreElements().cast(Void.class);
+                    .doOnError(Void -> isDisplayingRate = false);
         });
     }
 
-    private static Observable<Integer> buildExchangeRateArray(Double rate) {
-        return Observable.just(rate)
-                .map(Math::round)
-                .map(Double::toString)
-                .map(asString -> {
-                    if ( ! asString.contains("."))
-                        return asString;
-                    return asString.substring(0, asString.indexOf("."));
-                })
-                .map(string -> string.split("(?!^)"))
-                .flatMap(list -> {
-                    if (list.length > numberOfLights)
-                        throw new RuntimeException("Too many digits!");
-                    List<String> adjustedList = new ArrayList<>();
-                    for (int i = 0; i < numberOfLights - list.length; i++)
-                        adjustedList.add("0");
-                    Collections.addAll(adjustedList, list);
-                    return Observable.from(adjustedList.toArray(new String[adjustedList.size()]));
-                })
-                .map(Integer::valueOf);
+    private static Observable<Map<String, Double>> getRates() {
+
+        // Turn on yellow light, indicating network request
+        yellowLightOne.setState(true);
+
+        return wyreRatesService.rates()
+
+                // Disable yellow light
+                .doOnNext(Void -> yellowLightOne.setState(false))
+
+                .onErrorResumeNext(BitcoinLedExample::onRatesError);
     }
 
-    private static Observable<Void> blink(GpioPinDigitalOutput digitalOutput) {
-        return Observable.just(null)
-                .doOnNext(Void -> digitalOutput.setState(true))
-                .delay(500, TimeUnit.MILLISECONDS)
-                .doOnNext(Void -> digitalOutput.setState(false))
-                .delay(250, TimeUnit.MILLISECONDS)
+    private static Observable<Map<String, Double>> onRatesError(Throwable throwable) {
+        return Observable.defer(() -> {
+
+                // Disable yellow light
+                yellowLightOne.setState(false);
+
+                // Blink red lights 3 times
+                List<Observable<Void>> oErrorBlinks = new ArrayList<>();
+                for (int i = 0; i < redLights.size(); i++)
+                    oErrorBlinks.add(Utils.blink(redLights.get(i), 500).repeat(3));
+                return Observable.merge(oErrorBlinks)
+                        .defaultIfEmpty(null)
+                        .toList();
+            })
+            .flatMap(Void -> Observable.error(throwable));
+    }
+
+    private static Observable<Void> defaultModeHandler(Double rate) {
+        return Utils.buildExchangeRateArray(rate, numberOfLights)
+                .toList()
+                .flatMap(exchangeRateArray -> {
+
+                    // List of observables configured to trigger a light to blink a certain number of times
+                    List<Observable<Void>> oBlinks = new ArrayList<>();
+
+                    for (int i = 0; i < exchangeRateArray.size(); i++)
+                        oBlinks.add(Utils.blink(redLights.get(i), speedMs).repeat(exchangeRateArray.get(i)));
+
+                    // Run observables in order one after the other
+                    return Observable.concat(oBlinks);
+                })
+                .toList()
                 .ignoreElements().cast(Void.class);
     }
 
-    private static void reset() {
-        redLightOne.setState(false);
-        redLightTwo.setState(false);
-        redLightThree.setState(false);
-        redLightFour.setState(false);
-        redLightFive.setState(false);
+    private static Observable<Void> binaryModeHandler(Double rate) {
+        return Utils.buildExchangeRateArray(rate, numberOfLights)
+                .zipWith(Observable.interval(speedMs, TimeUnit.MILLISECONDS), (number, time) -> {
+                    List<Boolean> binaryValue = Utils.numberToBinarySequence.get(number);
+                    List<Observable<Void>> blinks = new ArrayList<>();
+                    for (int i = 0; i < binaryValue.size(); i++)
+                        if (binaryValue.get(i))
+                            blinks.add(Utils.blink(redLights.get(i), speedMs));
+                    return Observable.merge(blinks);
+                })
+                .flatMap(o -> o);
+    }
 
-        yellowLightOne.setState(false);
+    private static Observable<Void> reset() {
+        return Observable.defer(() -> {
+            yellowLightOne.setState(false);
+            return Observable.from(redLights)
+                    .doOnNext(light -> light.setState(false));
+        })
+        .ignoreElements().cast(Void.class);
+    }
+
+    private static class Listener {
+
+        static class StartButton implements GpioPinListenerDigital {
+
+            @Override
+            public void handleGpioPinDigitalStateChangeEvent(GpioPinDigitalStateChangeEvent event) {
+                if (event.getState() == PinState.HIGH)
+                    displayExchangeRate()
+                        .subscribe(Void -> {},
+                            throwable -> log.error("subscribe error: {}", throwable.toString()));
+            }
+        }
+
+        static class ModeButton implements GpioPinListenerDigital {
+
+            @Override
+            public void handleGpioPinDigitalStateChangeEvent(GpioPinDigitalStateChangeEvent event) {
+                if (event.getState() == PinState.HIGH)
+                    changeMode()
+                        .subscribe(Void -> {},
+                            throwable -> log.error("subscribe error: {}", throwable.toString()));
+            }
+        }
     }
 }
 
